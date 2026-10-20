@@ -2,82 +2,77 @@ package com.saas.billing;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.mockito.Mockito.CALLS_REAL_METHODS;
-import static org.mockito.Mockito.mockStatic;
 
 import com.saas.billing.domain.BillingCommand;
+import com.saas.billing.domain.Customer;
+import com.saas.billing.domain.Invoice;
 import com.saas.billing.domain.Money;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.ResultSet;
+import com.saas.billing.infrastructure.TokenPrefixPaymentGateway;
+import com.saas.billing.port.BillingInfrastructureException;
+import com.saas.billing.port.CustomerRepository;
+import com.saas.billing.port.NotificationService;
 import java.sql.SQLException;
-import java.sql.Statement;
+import java.time.Clock;
+import java.time.Instant;
 import java.time.LocalDate;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
-import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.BeforeEach;
+import java.util.Map;
+import java.util.Optional;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
-import org.mockito.MockedStatic;
 
 /**
- * Testes de caracterização: registram o comportamento ATUAL do código legado,
- * inclusive as esquisitices, para que a refatoração prove que não o alterou.
+ * Testes de caracterização: os mesmos cenários escritos contra o legado,
+ * agora rodando só em memória (portas falsas + Clock fixo), sem banco nem SMTP.
  */
 class SubscriptionBillingServiceTest {
 
+    private static final ZoneId SAO_PAULO = ZoneId.of("America/Sao_Paulo");
     private static final LocalDate OCTOBER_20 = LocalDate.of(2026, 10, 20);
     private static final LocalDate NOVEMBER_15 = LocalDate.of(2026, 11, 15);
     private static final String VALID_TOKEN = "tok_visa_4242";
 
-    @BeforeAll
-    static void installInMemoryDatabase() throws SQLException {
-        DriverManager.registerDriver(new PostgresToH2Driver());
-        try (Connection connection = h2(); Statement statement = connection.createStatement()) {
-            statement.execute("CREATE TABLE IF NOT EXISTS customers (id VARCHAR(20) PRIMARY KEY, email VARCHAR(100), status VARCHAR(20))");
-            statement.execute("CREATE TABLE IF NOT EXISTS invoices (customer_id VARCHAR(20), amount NUMERIC(12, 2), status VARCHAR(10), created_at TIMESTAMP)");
-        }
-    }
+    private final Map<String, Customer> customers = Stream.of(
+                    new Customer("C-ACTIVE", "ana@cliente.com", "ACTIVE"),
+                    new Customer("C-LOWER", "bia@cliente.com", "active"),
+                    new Customer("C-SUSPENDED", "caio@cliente.com", "SUSPENDED"),
+                    new Customer("C-NO-STATUS", "dani@cliente.com", null))
+            .collect(Collectors.toMap(Customer::id, Function.identity()));
+    private final List<Invoice> savedInvoices = new ArrayList<>();
+    private final List<String> sentEmails = new ArrayList<>();
 
-    @BeforeEach
-    void seedCustomers() throws SQLException {
-        PostgresToH2Driver.failConnections = false;
-        try (Connection connection = h2(); Statement statement = connection.createStatement()) {
-            statement.execute("DELETE FROM invoices");
-            statement.execute("DELETE FROM customers");
-            statement.execute("INSERT INTO customers VALUES "
-                    + "('C-ACTIVE', 'ana@cliente.com', 'ACTIVE'), "
-                    + "('C-LOWER', 'bia@cliente.com', 'active'), "
-                    + "('C-SUSPENDED', 'caio@cliente.com', 'SUSPENDED'), "
-                    + "('C-NO-STATUS', 'dani@cliente.com', NULL), "
-                    + "('C-BAD-EMAIL', 'email-invalido', 'ACTIVE')");
-        }
-    }
+    private CustomerRepository customerRepository = id -> Optional.ofNullable(customers.get(id));
+    private NotificationService notificationService = (email, amount) -> sentEmails.add(email + " " + amount.format());
 
     // ---------------------------------------------------------------- fluxo
 
     @Test
-    void activeCustomerWithValidCardIsChargedInvoicedAndNotified() throws SQLException {
-        // Nenhum servidor SMTP existe no teste: o "E-mail disparado" só aparece porque send() está comentado.
+    void activeCustomerWithValidCardIsChargedInvoicedAndNotified() {
         assertThat(scenario().run()).containsExactly(
                 "Pagamento processado com sucesso: R$ 100.00",
                 "E-mail disparado para: ana@cliente.com");
         assertThat(invoices()).containsExactly("C-ACTIVE 100.00 PAID");
+        assertThat(sentEmails).containsExactly("ana@cliente.com R$ 100.00");
     }
 
     @Test
-    void cardTokenWithoutTokPrefixFailsButInvoiceAndEmailStillHappen() throws SQLException {
+    void cardTokenWithoutTokPrefixFailsButInvoiceAndEmailStillHappen() {
         assertThat(scenario().cardToken("card_4242").run()).containsExactly(
                 "Falha no pagamento do cartão para: C-ACTIVE",
                 "E-mail disparado para: ana@cliente.com");
         assertThat(invoices()).containsExactly("C-ACTIVE 100.00 FAILED");
+        assertThat(sentEmails).containsExactly("ana@cliente.com R$ 100.00");
     }
 
     @Test
-    void missingCardTokenFailsPayment() throws SQLException {
+    void missingCardTokenFailsPayment() {
         assertThat(scenario().cardToken(null).run()).first()
                 .isEqualTo("Falha no pagamento do cartão para: C-ACTIVE");
         assertThat(invoices()).containsExactly("C-ACTIVE 100.00 FAILED");
@@ -91,23 +86,26 @@ class SubscriptionBillingServiceTest {
     }
 
     @Test
-    void inactiveCustomerIsNotCharged() throws SQLException {
+    void inactiveCustomerIsNotCharged() {
         assertThat(scenario().customer("C-SUSPENDED").run())
                 .containsExactly("Cliente inativo. Cobrança cancelada: C-SUSPENDED");
         assertThat(invoices()).isEmpty();
+        assertThat(sentEmails).isEmpty();
     }
 
     @Test
-    void customerWithoutStatusIsTreatedAsInactive() throws SQLException {
+    void customerWithoutStatusIsTreatedAsInactive() {
         assertThat(scenario().customer("C-NO-STATUS").run())
                 .containsExactly("Cliente inativo. Cobrança cancelada: C-NO-STATUS");
         assertThat(invoices()).isEmpty();
+        assertThat(sentEmails).isEmpty();
     }
 
     @Test
-    void unknownCustomerIsSilentlyIgnored() throws SQLException {
+    void unknownCustomerIsSilentlyIgnored() {
         assertThat(scenario().customer("C-GHOST").run()).isEmpty();
         assertThat(invoices()).isEmpty();
+        assertThat(sentEmails).isEmpty();
     }
 
     @Test
@@ -120,21 +118,26 @@ class SubscriptionBillingServiceTest {
     }
 
     @Test
-    void databaseFailureIsSwallowedIntoTheLogs() {
-        PostgresToH2Driver.failConnections = true;
+    void databaseFailureIsNoLongerSwallowedIntoTheLogs() {
+        // Legado: o catch (Exception e) virava "Erro fatal no processamento: ..." e a lista voltava como se nada fosse.
+        customerRepository = id -> {
+            throw new BillingInfrastructureException("Falha ao consultar o cliente " + id, new SQLException("Connection refused"));
+        };
 
-        assertThat(scenario().run())
-                .containsExactly("Erro fatal no processamento: Connection to localhost:5432 refused");
+        assertThatThrownBy(() -> scenario().run())
+                .isInstanceOf(BillingInfrastructureException.class)
+                .hasMessage("Falha ao consultar o cliente C-ACTIVE");
+        assertThat(invoices()).isEmpty();
     }
 
     @Test
-    void invalidEmailIsSwallowedAfterPaymentAndInvoice() throws SQLException {
-        List<String> logs = scenario().customer("C-BAD-EMAIL").run();
+    void emailFailurePropagatesAfterPaymentAndInvoice() {
+        notificationService = (email, amount) -> {
+            throw new BillingInfrastructureException("Falha no e-mail da fatura para " + email, null);
+        };
 
-        assertThat(logs).hasSize(2);
-        assertThat(logs.get(0)).isEqualTo("Pagamento processado com sucesso: R$ 100.00");
-        assertThat(logs.get(1)).startsWith("Erro fatal no processamento: ");
-        assertThat(invoices()).containsExactly("C-BAD-EMAIL 100.00 PAID");
+        assertThatThrownBy(() -> scenario().run()).isInstanceOf(BillingInfrastructureException.class);
+        assertThat(invoices()).containsExactly("C-ACTIVE 100.00 PAID");
     }
 
     // ---------------------------------------------------------------- preço
@@ -162,7 +165,7 @@ class SubscriptionBillingServiceTest {
     }
 
     @Test
-    void chargedAmountAndInvoiceAgreeToTheCent() throws SQLException {
+    void chargedAmountAndInvoiceAgreeToTheCent() {
         // No legado o log/e-mail mostrava R$ 62.99999999999999 enquanto a fatura gravava 63.00.
         assertThat(scenario().basePrice("90.00").nonProfit().chargedPrice()).isEqualTo("R$ 63.00");
         assertThat(invoices()).containsExactly("C-ACTIVE 63.00 PAID");
@@ -172,6 +175,14 @@ class SubscriptionBillingServiceTest {
     void blackFridayOnlyWorksInNovember() {
         assertThat(scenario().today(NOVEMBER_15).promo("BLACKFRIDAY").chargedPrice()).isEqualTo("R$ 70.00");
         assertThat(scenario().today(OCTOBER_20).promo("BLACKFRIDAY").chargedPrice()).isEqualTo("R$ 100.00");
+    }
+
+    @Test
+    void todayComesFromTheInjectedClockInItsOwnZone() {
+        // 01/11 01:00 UTC ainda é 31/10 em São Paulo: nada de Black Friday.
+        Clock lateOctoberNight = Clock.fixed(Instant.parse("2026-11-01T01:00:00Z"), SAO_PAULO);
+
+        assertThat(scenario().clock(lateOctoberNight).promo("BLACKFRIDAY").chargedPrice()).isEqualTo("R$ 100.00");
     }
 
     @Test
@@ -229,7 +240,7 @@ class SubscriptionBillingServiceTest {
     }
 
     @Test
-    void allRulesCombined() throws SQLException {
+    void allRulesCombined() {
         // 200 -15% = 170; ONG = 119; Black Friday = 89; multa 2% + 5 dias de juros = 91.225 exatos.
         // O legado (double) chegava a 91.22499999999998 e gravava 91.22; com Money o meio centavo
         // arredonda para cima uma única vez: 91.23. Única diferença de valor, intencional.
@@ -241,29 +252,22 @@ class SubscriptionBillingServiceTest {
 
     // ---------------------------------------------------------------- apoio
 
-    private static Scenario scenario() {
+    private Scenario scenario() {
         return new Scenario();
     }
 
-    private static Connection h2() throws SQLException {
-        return DriverManager.getConnection(PostgresToH2Driver.H2_URL, "sa", "");
+    private List<String> invoices() {
+        return savedInvoices.stream()
+                .map(invoice -> invoice.customerId() + " " + invoice.amount().amount().toPlainString() + " " + invoice.status())
+                .toList();
     }
 
-    private static List<String> invoices() throws SQLException {
-        List<String> rows = new ArrayList<>();
-        try (Connection connection = h2();
-             Statement statement = connection.createStatement();
-             ResultSet rs = statement.executeQuery("SELECT customer_id, amount, status, created_at FROM invoices")) {
-            while (rs.next()) {
-                assertThat(rs.getTimestamp("created_at")).isNotNull();
-                rows.add(rs.getString("customer_id") + " " + rs.getBigDecimal("amount").toPlainString() + " " + rs.getString("status"));
-            }
-        }
-        return rows;
+    private static Clock fixedAt(LocalDate date) {
+        return Clock.fixed(date.atStartOfDay(SAO_PAULO).toInstant(), SAO_PAULO);
     }
 
-    private static final class Scenario {
-        private LocalDate today = OCTOBER_20;
+    private final class Scenario {
+        private Clock clock = fixedAt(OCTOBER_20);
         private String customerId = "C-ACTIVE";
         private String basePrice = "100.00";
         private String signupDate = "2026-10-01";
@@ -273,7 +277,12 @@ class SubscriptionBillingServiceTest {
         private String cardToken = VALID_TOKEN;
 
         Scenario today(LocalDate today) {
-            this.today = today;
+            this.clock = fixedAt(today);
+            return this;
+        }
+
+        Scenario clock(Clock clock) {
+            this.clock = clock;
             return this;
         }
 
@@ -313,15 +322,13 @@ class SubscriptionBillingServiceTest {
         }
 
         List<String> run() {
-            // O legado chama LocalDate.now() estático: só um mock estático consegue congelar a data.
-            try (MockedStatic<LocalDate> frozenDate = mockStatic(LocalDate.class, CALLS_REAL_METHODS)) {
-                frozenDate.when(LocalDate::now).thenReturn(today);
-                return new SubscriptionBillingService().processMonthlyBilling(new BillingCommand(
-                        customerId, Money.of(basePrice), LocalDate.parse(signupDate), overdueDays, promoCode, nonProfit, cardToken));
-            }
+            SubscriptionBillingService service = new SubscriptionBillingService(
+                    customerRepository, savedInvoices::add, new TokenPrefixPaymentGateway(), notificationService, clock);
+            return service.processMonthlyBilling(new BillingCommand(
+                    customerId, Money.of(basePrice), LocalDate.parse(signupDate), overdueDays, promoCode, nonProfit, cardToken));
         }
 
-        /** O legado só expõe o preço calculado na linha de log do pagamento aprovado. */
+        /** O preço continua observado pela linha de log do pagamento aprovado, como no legado. */
         String chargedPrice() {
             String paymentLog = run().get(0);
             assertThat(paymentLog).startsWith("Pagamento processado com sucesso: ");
