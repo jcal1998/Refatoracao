@@ -24,9 +24,6 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.CsvSource;
-import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * Testes de caracterização: os mesmos cenários escritos contra o legado,
@@ -140,29 +137,7 @@ class SubscriptionBillingServiceTest {
         assertThat(invoices()).containsExactly("C-ACTIVE 100.00 PAID");
     }
 
-    // ---------------------------------------------------------------- preço
-
-    @ParameterizedTest
-    @CsvSource({
-            "2025-10-20, R$ 100.00", // 12 meses: ainda sem desconto (> 12 é estrito)
-            "2025-09-20, R$ 90.00",  // 13 meses: 10%
-            "2024-10-20, R$ 90.00",  // 24 meses: ainda 10% (> 24 é estrito)
-            "2024-09-20, R$ 85.00"   // 25 meses: 15%
-    })
-    void loyaltyDiscountUsesStrictBoundaries(String signupDate, String expectedPrice) {
-        assertThat(scenario().signup(signupDate).chargedPrice()).isEqualTo(expectedPrice);
-    }
-
-    @Test
-    void monthsAreCountedByCalendarMonthIgnoringTheDay() {
-        // 30/09/2025 -> 20/10/2026 conta 13 meses; ChronoUnit.MONTHS.between daria 12.
-        assertThat(scenario().signup("2025-09-30").chargedPrice()).isEqualTo("R$ 90.00");
-    }
-
-    @Test
-    void nonProfitDiscountIsAppliedAfterLoyalty() {
-        assertThat(scenario().signup("2024-09-20").nonProfit().chargedPrice()).isEqualTo("R$ 59.50");
-    }
+    // ------------------------------------- preço e relógio (regras em PricingCalculatorTest)
 
     @Test
     void chargedAmountAndInvoiceAgreeToTheCent() {
@@ -183,60 +158,6 @@ class SubscriptionBillingServiceTest {
         Clock lateOctoberNight = Clock.fixed(Instant.parse("2026-11-01T01:00:00Z"), SAO_PAULO);
 
         assertThat(scenario().clock(lateOctoberNight).promo("BLACKFRIDAY").chargedPrice()).isEqualTo("R$ 100.00");
-    }
-
-    @Test
-    void promoCodeIsCaseInsensitiveButNotTrimmed() {
-        assertThat(scenario().today(NOVEMBER_15).promo("blackfriday").chargedPrice()).isEqualTo("R$ 70.00");
-        assertThat(scenario().today(NOVEMBER_15).promo(" BLACKFRIDAY ").chargedPrice()).isEqualTo("R$ 100.00");
-    }
-
-    @Test
-    void blackFridayIsSubtractedAfterNonProfitDiscount() {
-        // 100 * 0.70 - 30 = 40 (na ordem inversa seriam 49).
-        assertThat(scenario().today(NOVEMBER_15).nonProfit().promo("BLACKFRIDAY").chargedPrice()).isEqualTo("R$ 40.00");
-    }
-
-    @ParameterizedTest
-    @CsvSource({
-            "2026-10-01, R$ 90.00",  // 0 meses
-            "2026-09-29, R$ 90.00",  // 1 mês
-            "2026-08-31, R$ 100.00", // 2 meses
-            "2026-12-01, R$ 90.00"   // adesão no futuro: -2 meses também ganha
-    })
-    void welcomeCouponOnlyForUpToOneMonth(String signupDate, String expectedPrice) {
-        assertThat(scenario().signup(signupDate).promo("WELCOME10").chargedPrice()).isEqualTo(expectedPrice);
-    }
-
-    @ParameterizedTest
-    @ValueSource(strings = {"", "   ", "PROMO50"})
-    void blankOrUnknownPromoCodeIsIgnored(String promoCode) {
-        assertThat(scenario().promo(promoCode).chargedPrice()).isEqualTo("R$ 100.00");
-    }
-
-    @Test
-    void overdueAddsTwoPercentPenaltyPlusSimpleDailyInterest() {
-        assertThat(scenario().overdueDays(10).chargedPrice()).isEqualTo("R$ 103.00");
-    }
-
-    @ParameterizedTest
-    @ValueSource(ints = {0, -5})
-    void noOverdueChargesWithoutPositiveOverdueDays(int overdueDays) {
-        assertThat(scenario().overdueDays(overdueDays).chargedPrice()).isEqualTo("R$ 100.00");
-    }
-
-    @Test
-    void overdueChargesApplyToTheDiscountedPrice() {
-        assertThat(scenario().today(NOVEMBER_15).promo("BLACKFRIDAY").overdueDays(10).chargedPrice())
-                .isEqualTo("R$ 72.10");
-    }
-
-    @Test
-    void negativePriceIsClampedToZeroAfterOverdueCharges() {
-        assertThat(scenario().basePrice("20.00").today(NOVEMBER_15).promo("BLACKFRIDAY").chargedPrice())
-                .isEqualTo("R$ 0.00");
-        assertThat(scenario().basePrice("20.00").today(NOVEMBER_15).promo("BLACKFRIDAY").overdueDays(10).chargedPrice())
-                .isEqualTo("R$ 0.00");
     }
 
     @Test
